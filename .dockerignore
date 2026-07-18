@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+uploads/*
+outputs/*.mp4
+outputs/*.mp3
+!outputs/.gitkeep
+.git/
+.gitignore
+*.md
+.DS_Store
