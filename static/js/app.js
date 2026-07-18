@@ -1,521 +1,755 @@
-/* ============================================================
-   Jigarzzz Video Suite — Frontend Logic
-   Wires up tabs, forms, TTS controls, uploads, and the library.
-   ============================================================ */
-(() => {
-  'use strict';
+/* ================================================================
+   Jigarzzz❤️ — Premium Video Suite · app.js  v5
+   ================================================================ */
+'use strict';
 
-  const $ = (id) => document.getElementById(id);
-  const qsa = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+// ─────────────────────────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────────────────────────
+const state = {
+    voiceData:    null,      // { voices, voice_styles, mood_labels }
+    currentLang:  'ur-PK',
+    currentVoice: '',
+    currentStyle: '',        // selected mood key
+    rateVal:      0,
+    pitchVal:     0,
+    statsFiles:   0,
+    statsClips:   0,
+    statsAudio:   0,
+};
 
-  const LANG_LABELS = {
-    'ur-PK': '🇵🇰 Urdu (Pakistan)',
-    'ur-IN': '🕊️ Punjabi / Urdu (India) — Gul & Salman',
-    'hi-IN': '🇮🇳 Hindi (India)',
-    'pa-IN': '🌾 Punjabi (India) — Native',
-    'en-US': '🇺🇸 English (US)',
-    'en-GB': '🇬🇧 English (UK)',
-    'en-AU': '🇦🇺 English (Australian)',
-  };
+// ─────────────────────────────────────────────────────────────────
+// UTILITIES
+// ─────────────────────────────────────────────────────────────────
+function $(id)   { return document.getElementById(id); }
+function $q(sel) { return document.querySelector(sel); }
 
-  let VOICE_DATA = null; // { voices, voice_styles, mood_labels, age_presets }
+function showToast(msg, type = 'success', duration = 3500) {
+    const t = $('toast');
+    t.textContent = msg;
+    t.className = `toast ${type} show`;
+    setTimeout(() => t.classList.remove('show'), duration);
+}
 
-  /* ---------------- Toast ---------------- */
-  let toastTimer = null;
-  function toast(msg, type = 'success') {
-    const el = $('toast');
-    if (!el) return;
-    el.textContent = msg;
-    el.className = `toast show ${type}`;
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => el.classList.remove('show'), 3800);
-  }
+function animateCount(el, target) {
+    const start = parseInt(el.textContent) || 0;
+    const diff  = target - start;
+    if (diff === 0) return;
+    const step  = Math.ceil(Math.abs(diff) / 20);
+    const dir   = diff > 0 ? 1 : -1;
+    let cur = start;
+    const iv = setInterval(() => {
+        cur += dir * step;
+        if ((dir > 0 && cur >= target) || (dir < 0 && cur <= target)) {
+            cur = target;
+            clearInterval(iv);
+        }
+        el.textContent = cur;
+    }, 40);
+}
 
-  /* ---------------- Tabs ---------------- */
-  function initTabs() {
-    const buttons = qsa('.tab-btn');
-    buttons.forEach((btn) => {
-      btn.addEventListener('click', () => {
-        buttons.forEach((b) => b.classList.remove('active'));
-        qsa('.tab-content').forEach((c) => c.classList.remove('active'));
-        btn.classList.add('active');
-        $(btn.dataset.tab)?.classList.add('active');
-      });
-    });
-  }
+// ─────────────────────────────────────────────────────────────────
+// GALLERY / LIBRARY
+// ─────────────────────────────────────────────────────────────────
+async function loadGallery() {
+    const container = $('gallery-container');
+    const searchVal = ($('library-search')?.value || '').toLowerCase();
 
-  /* ---------------- Generic toggle-btn groups (audio source / slicing mode) --- */
-  function wireToggleGroup(pairs) {
-    const buttons = pairs.map((p) => $(p.btnId)).filter(Boolean);
-    buttons.forEach((btn) => {
-      btn.addEventListener('click', () => {
-        buttons.forEach((b) => b.classList.remove('active'));
-        btn.classList.add('active');
-        pairs.forEach((p) => $(p.panelId)?.classList.remove('active'));
-        const match = pairs.find((p) => p.btnId === btn.id);
-        if (match) $(match.panelId)?.classList.add('active');
-      });
-    });
-  }
+    try {
+        const res  = await fetch('/api/outputs');
+        const data = await res.json();
 
-  function currentToggleType(pairs) {
-    const active = pairs.find((p) => $(p.btnId)?.classList.contains('active'));
-    return active ? $(active.btnId).dataset.type : pairs[0].value;
-  }
+        const filtered = searchVal
+            ? data.filter(f => f.filename.toLowerCase().includes(searchVal))
+            : data;
 
-  /* ---------------- Voice / Mood / Age panels ---------------- */
-  function formatRate(v) { return (v >= 0 ? '+' : '') + v + '%'; }
-  function formatPitch(v) { return (v >= 0 ? '+' : '') + v + 'Hz'; }
-  function rateLabelText(v) { if (v <= -20) return 'Slow'; if (v >= 20) return 'Fast'; return 'Normal'; }
-  function pitchLabelText(v) { if (v <= -50) return 'Low'; if (v >= 50) return 'High'; return 'Normal'; }
+        if (!filtered.length) {
+            container.innerHTML = `
+                <div class="empty-library">
+                    <div class="library-empty-art">${searchVal ? '🔍' : '🎞️'}</div>
+                    <span>${searchVal ? 'No files match your search.' : 'No files exported yet.<br>Run a merge or clip operation to begin.'}</span>
+                </div>`;
+            animateCount($('stat-files'), 0);
+            return;
+        }
 
-  function initVoicePanel(cfg) {
-    const langSel = $(cfg.lang), voiceSel = $(cfg.voice);
-    const moodGrid = $(cfg.moodGrid), moodTag = $(cfg.moodTag), ageGrid = $(cfg.ageGrid);
-    const rateSlider = $(cfg.rateSlider), pitchSlider = $(cfg.pitchSlider);
-    const rateVal = $(cfg.rateVal), pitchVal = $(cfg.pitchVal);
-    const styleHidden = $(cfg.styleHidden), styleDegreeHidden = $(cfg.styleDegreeHidden);
-    const rateHidden = $(cfg.rateHidden), pitchHidden = $(cfg.pitchHidden);
-    if (!langSel || !voiceSel) return;
+        state.statsFiles = data.length;
+        animateCount($('stat-files'), data.length);
 
-    // Populate language dropdown if empty (e.g. AI tab's <select> is blank in HTML)
-    if (langSel.options.length === 0) {
-      Object.keys(VOICE_DATA.voices).forEach((code) => {
-        const opt = document.createElement('option');
-        opt.value = code;
-        opt.textContent = LANG_LABELS[code] || code;
-        if (code === 'ur-PK') opt.selected = true;
-        langSel.appendChild(opt);
-      });
-    }
+        container.innerHTML = filtered.map(file => {
+            const isClip  = file.filename.includes('clip_');
+            const icon    = isClip ? '✂️' : '🎬';
+            return `
+            <div class="video-card" data-fn="${file.filename}">
+                <div class="video-card-info">
+                    <span class="video-card-title">${icon} ${file.filename}</span>
+                    <span class="video-card-meta">${file.duration} &nbsp;|&nbsp; ${file.size}</span>
+                </div>
+                <div class="video-card-actions">
+                    <button class="action-btn play-action" data-fn="${file.filename}">▶ Play</button>
+                    <button class="action-btn download-action" data-fn="${file.filename}">↓ Save</button>
+                </div>
+            </div>`;
+        }).join('');
 
-    function refreshVoices() {
-      const lang = langSel.value;
-      const voices = VOICE_DATA.voices[lang] || {};
-      voiceSel.innerHTML = '';
-      Object.entries(voices).forEach(([label, id]) => {
-        const opt = document.createElement('option');
-        opt.value = id;
-        opt.textContent = label;
-        voiceSel.appendChild(opt);
-      });
-      refreshMood();
-    }
-
-    function refreshMood() {
-      const voiceId = voiceSel.value;
-      const supported = (VOICE_DATA.voice_styles && VOICE_DATA.voice_styles[voiceId]) || [];
-      const keys = ['', ...supported];
-      moodGrid.innerHTML = '';
-      keys.forEach((key) => {
-        const chip = document.createElement('div');
-        chip.className = 'mood-chip' + (key === '' ? ' active' : '');
-        chip.textContent = VOICE_DATA.mood_labels[key] || key;
-        chip.dataset.key = key;
-        chip.addEventListener('click', () => {
-          qsa('.mood-chip', moodGrid).forEach((c) => c.classList.remove('active'));
-          chip.classList.add('active');
-          if (styleHidden) styleHidden.value = key;
-          if (styleDegreeHidden) styleDegreeHidden.value = '1.0';
+        // Wire up play / download
+        container.querySelectorAll('.play-action').forEach(btn => {
+            btn.addEventListener('click', () => openVideoModal(btn.dataset.fn));
         });
-        moodGrid.appendChild(chip);
-      });
-      if (styleHidden) styleHidden.value = '';
-      if (moodTag) {
-        moodTag.textContent = supported.length
-          ? `${supported.length} styles supported`
-          : 'No extra styles for this voice';
-      }
-    }
-
-    function wireSlider(slider, valEl, hiddenEl, fmt, labelFn) {
-      if (!slider) return;
-      slider.addEventListener('input', () => {
-        const v = parseInt(slider.value, 10);
-        if (valEl) valEl.textContent = labelFn(v);
-        if (hiddenEl) hiddenEl.value = fmt(v);
-      });
-    }
-    wireSlider(rateSlider, rateVal, rateHidden, formatRate, rateLabelText);
-    wireSlider(pitchSlider, pitchVal, pitchHidden, formatPitch, pitchLabelText);
-
-    function renderAgeGrid() {
-      if (!ageGrid || !VOICE_DATA.age_presets) return;
-      ageGrid.innerHTML = '';
-      Object.entries(VOICE_DATA.age_presets).forEach(([key, preset]) => {
-        const chip = document.createElement('div');
-        chip.className = 'age-chip' + (key === 'adult' ? ' active' : '');
-        chip.innerHTML = `${preset.label}<span class="age-desc">${preset.desc}</span>`;
-        chip.addEventListener('click', () => {
-          qsa('.age-chip', ageGrid).forEach((c) => c.classList.remove('active'));
-          chip.classList.add('active');
-          const rateNum = parseInt(preset.rate, 10);
-          const pitchNum = parseInt(preset.pitch, 10);
-          if (rateSlider) { rateSlider.value = rateNum; rateSlider.dispatchEvent(new Event('input')); }
-          if (pitchSlider) { pitchSlider.value = pitchNum; pitchSlider.dispatchEvent(new Event('input')); }
+        container.querySelectorAll('.download-action').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const a = document.createElement('a');
+                a.href = `/api/outputs/${btn.dataset.fn}`;
+                a.download = btn.dataset.fn;
+                a.click();
+            });
         });
-        ageGrid.appendChild(chip);
-      });
+
+    } catch (e) {
+        container.innerHTML = `<div class="empty-library"><span>Failed to load library.</span></div>`;
     }
-    renderAgeGrid();
+}
 
-    langSel.addEventListener('change', refreshVoices);
-    voiceSel.addEventListener('change', refreshMood);
-    refreshVoices();
-  }
+// ─────────────────────────────────────────────────────────────────
+// CLEAR LIBRARY
+// ─────────────────────────────────────────────────────────────────
+async function clearLibrary() {
+    const confirmed = confirm('🗑️ Delete ALL exported files from disk?\n\nThis cannot be undone.');
+    if (!confirmed) return;
 
-  function wirePreviewButton(btnId, cfg) {
-    const btn = $(btnId);
-    if (!btn) return;
-    btn.addEventListener('click', async () => {
-      const voiceSel = $(cfg.voice), langSel = $(cfg.lang);
-      const styleHidden = $(cfg.styleHidden), styleDegreeHidden = $(cfg.styleDegreeHidden);
-      const rateHidden = $(cfg.rateHidden), pitchHidden = $(cfg.pitchHidden);
-      const player = $(cfg.playerWrap), audio = $(cfg.audioEl);
-      const original = btn.textContent;
-      btn.textContent = '⏳ Loading…';
-      btn.disabled = true;
-      try {
+    const btn = $('clear-library-btn');
+    btn.textContent = '⏳ Clearing…';
+    btn.disabled = true;
+
+    try {
+        const res  = await fetch('/api/clear-library', { method: 'POST' });
+        const data = await res.json();
+        showToast(`✅ Cleared ${data.deleted} file${data.deleted !== 1 ? 's' : ''} from library`, 'success');
+        animateCount($('stat-files'), 0);
+        await loadGallery();
+    } catch (e) {
+        showToast('❌ Failed to clear library', 'error');
+    } finally {
+        btn.textContent = '🗑 Clear All';
+        btn.disabled = false;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// VIDEO MODAL
+// ─────────────────────────────────────────────────────────────────
+function openVideoModal(filename) {
+    $('modal-title').textContent = `▶ ${filename}`;
+    $('modal-player').src = `/api/outputs/${filename}`;
+    $('video-modal').classList.add('active');
+    $('modal-player').play();
+}
+function closeVideoModal() {
+    $('modal-player').pause();
+    $('modal-player').src = '';
+    $('video-modal').classList.remove('active');
+}
+
+// ─────────────────────────────────────────────────────────────────
+// VOICE SYSTEM
+// ─────────────────────────────────────────────────────────────────
+async function loadVoices() {
+    try {
+        const res  = await fetch('/api/voices');
+        state.voiceData = await res.json();
+        updateVoiceDropdown(state.currentLang, 'tts');
+        updateVoiceDropdown(state.currentLang, 'ai');
+    } catch (e) {
+        console.error('Failed to load voices:', e);
+    }
+}
+
+function updateVoiceDropdown(lang, prefix = 'tts') {
+    const voiceSel = $(`${prefix}-voice`);
+    if (!voiceSel || !state.voiceData) return;
+
+    const voices = state.voiceData.voices[lang] || {};
+    voiceSel.innerHTML = Object.entries(voices).map(([label, id]) =>
+        `<option value="${id}">${label}</option>`
+    ).join('');
+
+    if (prefix === 'tts') {
+        state.currentVoice = voiceSel.value;
+        updateMoodGrid('tts');
+        buildAgeGrid('tts');
+    } else {
+        state.aiCurrentVoice = voiceSel.value;
+        updateMoodGrid('ai');
+        buildAgeGrid('ai');
+    }
+}
+
+function updateMoodGrid(prefix = 'tts') {
+    const voice      = $(`${prefix}-voice`)?.value || '';
+    const moodGrid   = $(`${prefix}-mood-grid`);
+    const moodTag    = $(`${prefix}-mood-support-tag`);
+    const moodData   = state.voiceData?.voice_styles || {};
+    const moodLabels = state.voiceData?.mood_labels  || {};
+    const supported  = moodData[voice] || [];
+
+    if (prefix === 'tts') state.currentVoice = voice;
+    else state.aiCurrentVoice = voice;
+
+    if (!moodGrid) return;
+
+    if (supported.length === 0) {
+        if (moodTag) {
+            moodTag.textContent   = '⚠ Default only — switch to Aria/Jenny/Tony/Nancy for moods';
+            moodTag.className     = 'mood-support-tag unsupported';
+        }
+        const allMoods = Object.entries(moodLabels);
+        moodGrid.innerHTML = allMoods.map(([key, label]) => {
+            const active = key === '' ? 'active' : '';
+            return `<span class="mood-chip disabled ${active}" data-mood="${key}">${label}</span>`;
+        }).join('');
+        if (prefix === 'tts') {
+            state.currentStyle = '';
+            $('tts-style').value = '';
+        } else {
+            state.aiCurrentStyle = '';
+            $('ai-tts-style').value = '';
+        }
+    } else {
+        if (moodTag) {
+            moodTag.textContent = '✓ Mood supported';
+            moodTag.className   = 'mood-support-tag supported';
+        }
+        const currentStyle = prefix === 'tts' ? state.currentStyle : state.aiCurrentStyle;
+        const chips = [['', moodLabels[''] || '🎙️ Default Style'], ...supported.map(k => [k, moodLabels[k] || k])];
+        moodGrid.innerHTML = chips.map(([key, label]) => {
+            const active = key === currentStyle ? 'active' : '';
+            return `<span class="mood-chip ${active}" data-mood="${key}">${label}</span>`;
+        }).join('');
+    }
+
+    // Wire mood chip clicks
+    moodGrid.querySelectorAll('.mood-chip:not(.disabled)').forEach(chip => {
+        chip.addEventListener('click', () => {
+            moodGrid.querySelectorAll('.mood-chip').forEach(c => c.classList.remove('active'));
+            chip.classList.add('active');
+            if (prefix === 'tts') {
+                state.currentStyle       = chip.dataset.mood;
+                $('tts-style').value     = chip.dataset.mood;
+            } else {
+                state.aiCurrentStyle     = chip.dataset.mood;
+                $('ai-tts-style').value  = chip.dataset.mood;
+            }
+        });
+    });
+}
+
+function buildAgeGrid(prefix = 'tts') {
+    const grid     = $(`${prefix}-age-grid`);
+    const presets  = state.voiceData?.age_presets || {};
+    if (!grid) return;
+
+    const currentAge = prefix === 'tts' ? (state.currentAge || 'adult') : (state.aiCurrentAge || 'adult');
+
+    grid.innerHTML = Object.entries(presets).map(([key, p]) => {
+        const active = key === currentAge ? 'active' : '';
+        return `
+        <span class="age-chip ${active}" data-age="${key}"
+              data-rate="${p.rate}" data-pitch="${p.pitch}">
+            ${p.label}
+            <span class="age-desc">${p.desc}</span>
+        </span>`;
+    }).join('');
+
+    grid.querySelectorAll('.age-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+            grid.querySelectorAll('.age-chip').forEach(c => c.classList.remove('active'));
+            chip.classList.add('active');
+            if (prefix === 'tts') {
+                state.currentAge = chip.dataset.age;
+            } else {
+                state.aiCurrentAge = chip.dataset.age;
+            }
+
+            const rateStr  = chip.dataset.rate;
+            const pitchStr = chip.dataset.pitch;
+            const rateNum  = parseInt(rateStr);
+            const pitchNum = parseInt(pitchStr);
+
+            // Update sliders (forms read from sliders on submit)
+            const rSlider = $(`${prefix}-rate-slider`);
+            const pSlider = $(`${prefix}-pitch-slider`);
+            if (rSlider) {
+                rSlider.value = rateNum;
+                $(`${prefix}-rate-val`).textContent = formatRate(rateNum);
+                // Dispatch input event so initSliders listeners also update state
+                rSlider.dispatchEvent(new Event('input'));
+            }
+            if (pSlider) {
+                pSlider.value = pitchNum;
+                $(`${prefix}-pitch-val`).textContent = formatPitch(pitchNum);
+                pSlider.dispatchEvent(new Event('input'));
+            }
+        });
+    });
+
+    if (prefix === 'tts' && !state.currentAge) state.currentAge = 'adult';
+    if (prefix === 'ai' && !state.aiCurrentAge) state.aiCurrentAge = 'adult';
+}
+
+function formatRate(v)  {
+    if (v === 0) return 'Normal';
+    return v > 0 ? `+${v}% faster` : `${v}% slower`;
+}
+function formatPitch(v) {
+    if (v === 0) return 'Normal';
+    return v > 0 ? `+${v}Hz higher` : `${v}Hz lower`;
+}
+
+function initSliders(prefix = 'tts') {
+    const rateSlider  = $(`${prefix}-rate-slider`);
+    const pitchSlider = $(`${prefix}-pitch-slider`);
+    if (!rateSlider || !pitchSlider) return;
+
+    rateSlider.addEventListener('input', () => {
+        const v = parseInt(rateSlider.value);
+        if (prefix === 'tts') state.rateVal = v;
+        else state.aiRateVal = v;
+        $(`${prefix}-rate-val`).textContent = formatRate(v);
+    });
+
+    pitchSlider.addEventListener('input', () => {
+        const v = parseInt(pitchSlider.value);
+        if (prefix === 'tts') state.pitchVal = v;
+        else state.aiPitchVal = v;
+        $(`${prefix}-pitch-val`).textContent = formatPitch(v);
+    });
+}
+
+async function previewVoice(prefix = 'tts') {
+    const btn    = $(prefix === 'tts' ? 'preview-voice-btn' : 'ai-preview-voice-btn');
+    const player = $(prefix === 'tts' ? 'voice-preview-player' : 'ai-voice-preview-player');
+    const audio  = $(prefix === 'tts' ? 'preview-audio' : 'ai-preview-audio');
+    const voice  = $(`${prefix}-voice`)?.value;
+    const lang   = $(`${prefix}-language`)?.value || 'ur-PK';
+    const style  = prefix === 'tts' ? state.currentStyle : state.aiCurrentStyle;
+    const rateV  = parseInt($(`${prefix}-rate-slider`)?.value || 0);
+    const pitchV = parseInt($(`${prefix}-pitch-slider`)?.value || 0);
+    const rate   = rateV  >= 0 ? `+${rateV}%`   : `${rateV}%`;
+    const pitch  = pitchV >= 0 ? `+${pitchV}Hz`  : `${pitchV}Hz`;
+
+    if (!voice) return;
+
+    btn.classList.add('loading');
+    btn.textContent = '⏳ Generating…';
+
+    try {
         const fd = new FormData();
-        fd.append('voice', voiceSel.value);
-        fd.append('lang', langSel.value);
-        fd.append('style', styleHidden ? styleHidden.value : '');
-        fd.append('style_degree', styleDegreeHidden ? styleDegreeHidden.value : '1.0');
-        fd.append('rate', rateHidden ? rateHidden.value : '+0%');
-        fd.append('pitch', pitchHidden ? pitchHidden.value : '+0Hz');
+        fd.append('voice', voice);
+        fd.append('lang',  lang);
+        fd.append('style', style);
+        fd.append('style_degree', '1.5');
+        fd.append('rate',  rate);
+        fd.append('pitch', pitch);
+
         const res = await fetch('/api/preview-voice', { method: 'POST', body: fd });
-        if (!res.ok) throw new Error('Preview generation failed');
+        if (!res.ok) throw new Error('Server error');
+
         const blob = await res.blob();
-        audio.src = URL.createObjectURL(blob);
+        const url  = URL.createObjectURL(blob);
+        audio.src  = url;
         player.style.display = 'block';
         audio.play();
-      } catch (err) {
-        toast(err.message || 'Preview failed', 'error');
-      } finally {
-        btn.textContent = original;
-        btn.disabled = false;
-      }
-    });
-  }
 
-  /* ---------------- Drag & drop video uploader (merge tab) ---------------- */
-  let selectedVideoFiles = [];
-  function initDropzone() {
-    const zone = $('video-dropzone');
-    const input = $('videos');
-    const queue = $('video-queue');
-    const pill = $('video-count-pill');
-    if (!zone || !input) return;
-
-    function renderQueue() {
-      queue.innerHTML = '';
-      selectedVideoFiles.forEach((file, idx) => {
-        const item = document.createElement('div');
-        item.className = 'queue-item';
-        const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
-        item.innerHTML = `<span>🎬 ${file.name} <small style="opacity:.55">(${sizeMb} MB)</small></span>`;
-        const removeBtn = document.createElement('button');
-        removeBtn.type = 'button';
-        removeBtn.className = 'remove-btn';
-        removeBtn.textContent = '✕';
-        removeBtn.addEventListener('click', () => {
-          selectedVideoFiles.splice(idx, 1);
-          renderQueue();
-        });
-        item.appendChild(removeBtn);
-        queue.appendChild(item);
-      });
-      if (pill) {
-        pill.style.display = selectedVideoFiles.length ? 'inline-flex' : 'none';
-        pill.textContent = `${selectedVideoFiles.length} file${selectedVideoFiles.length === 1 ? '' : 's'}`;
-      }
+        showToast('🎧 Playing voice preview!', 'success', 2500);
+    } catch (e) {
+        showToast('❌ Preview failed — check server logs', 'error');
+    } finally {
+        btn.classList.remove('loading');
+        btn.textContent = '▶ Preview';
     }
+}
 
-    input.addEventListener('change', () => {
-      selectedVideoFiles = selectedVideoFiles.concat(Array.from(input.files || []));
-      input.value = '';
-      renderQueue();
+// ─────────────────────────────────────────────────────────────────
+// TABS
+// ─────────────────────────────────────────────────────────────────
+function initTabs() {
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            btn.classList.add('active');
+            $(btn.dataset.tab)?.classList.add('active');
+        });
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────
+// AUDIO SOURCE TOGGLE (TTS / Upload / None)
+// ─────────────────────────────────────────────────────────────────
+function initAudioToggle() {
+    const toggles = document.querySelectorAll('#merger-tab .toggle-btn');
+    toggles.forEach(btn => {
+        btn.addEventListener('click', () => {
+            toggles.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            const type = btn.dataset.type;
+            $('tts-panel')?.classList.toggle('active', type === 'script');
+            $('audio-upload-panel')?.classList.toggle('active', type === 'upload');
+            $('no-audio-panel')?.classList.toggle('active', type === 'none');
+        });
     });
 
-    ['dragover', 'dragenter'].forEach((evt) =>
-      zone.addEventListener(evt, (e) => { e.preventDefault(); zone.classList.add('dragover'); })
-    );
-    ['dragleave', 'dragend'].forEach((evt) =>
-      zone.addEventListener(evt, () => zone.classList.remove('dragover'))
-    );
-    zone.addEventListener('drop', (e) => {
-      e.preventDefault();
-      zone.classList.remove('dragover');
-      const files = Array.from(e.dataTransfer.files || []).filter((f) => f.type.startsWith('video/'));
-      selectedVideoFiles = selectedVideoFiles.concat(files);
-      renderQueue();
+    const clipToggles = document.querySelectorAll('#clipper-tab .toggle-btn');
+    clipToggles.forEach(btn => {
+        btn.addEventListener('click', () => {
+            clipToggles.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            const type = btn.dataset.type;
+            $('auto-clip-panel')?.classList.toggle('active', type === 'auto');
+            $('timestamps-clip-panel')?.classList.toggle('active', type === 'timestamps');
+        });
     });
-  }
+}
 
-  /* ---------------- Progress bar simulation ---------------- */
-  function simulateProgress(prefix, steps) {
-    const wrap = $(`${prefix}-progress`);
-    const fill = $(`${prefix}-fill`);
-    const pct = $(`${prefix}-pct`);
-    const stepText = $(`${prefix}-step`);
-    wrap?.classList.add('visible');
-    let i = 0, value = 0;
-    const timer = setInterval(() => {
-      value = Math.min(value + Math.random() * 9 + 3, 90);
-      if (fill) fill.style.width = `${value}%`;
-      if (pct) pct.textContent = `${Math.round(value)}%`;
-      if (stepText && steps.length) {
-        stepText.textContent = steps[Math.min(i, steps.length - 1)];
-        if (value > ((i + 1) / steps.length) * 90) i++;
-      }
-    }, 700);
-    return {
-      finish() {
-        clearInterval(timer);
-        if (fill) fill.style.width = '100%';
-        if (pct) pct.textContent = '100%';
-        if (stepText) stepText.textContent = 'Done!';
-        setTimeout(() => wrap?.classList.remove('visible'), 1200);
-      },
-      fail() {
-        clearInterval(timer);
-        wrap?.classList.remove('visible');
-      },
-    };
-  }
+// ─────────────────────────────────────────────────────────────────
+// DROPZONE
+// ─────────────────────────────────────────────────────────────────
+function initDropzone() {
+    const dropzone  = $('video-dropzone');
+    const fileInput = $('videos');
+    const queue     = $('video-queue');
+    const pill      = $('video-count-pill');
+    if (!dropzone) return;
 
-  function setSubmitting(btnId, submitting) {
-    const btn = $(btnId);
-    if (!btn) return;
-    btn.disabled = submitting;
-    btn.classList.toggle('loading', submitting);
-  }
+    dropzone.addEventListener('click', () => fileInput.click());
+    dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag-over'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag-over'));
+    dropzone.addEventListener('drop', e => {
+        e.preventDefault();
+        dropzone.classList.remove('drag-over');
+        handleFiles(e.dataTransfer.files);
+    });
+    fileInput.addEventListener('change', () => handleFiles(fileInput.files));
 
-  /* ---------------- Form: Merge Videos ---------------- */
-  function initMergeForm() {
+    function handleFiles(files) {
+        const arr = Array.from(files).filter(f => f.type.startsWith('video/'));
+        queue.innerHTML = arr.map(f =>
+            `<div class="file-item"><span>🎞️ ${f.name}</span><span>${(f.size/1024/1024).toFixed(1)} MB</span></div>`
+        ).join('');
+        pill.style.display = arr.length ? 'inline-flex' : 'none';
+        pill.textContent   = `${arr.length} file${arr.length !== 1 ? 's' : ''}`;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// PROGRESS BAR ANIMATION
+// ─────────────────────────────────────────────────────────────────
+function startProgress(fillId, pctId, stepId, steps, onDone) {
+    const fill = $(fillId);
+    const pct  = $(pctId);
+    const step = $(stepId);
+    if (!fill) return null;
+
+    let idx = 0;
+    let cur = 0;
+
+    const iv = setInterval(() => {
+        if (idx >= steps.length) { clearInterval(iv); onDone?.(); return; }
+        const { pct: target, label, dur } = steps[idx];
+        step.textContent = label;
+
+        const speed = (target - cur) / (dur / 120);
+        const inner = setInterval(() => {
+            cur = Math.min(cur + speed, target);
+            fill.style.width = `${cur}%`;
+            pct.textContent  = `${Math.round(cur)}%`;
+            if (cur >= target) { clearInterval(inner); idx++; }
+        }, 120);
+    }, 0);
+
+    return iv;
+}
+
+function showProgress(progressId) {
+    $(progressId)?.classList.add('visible');
+}
+function hideProgress(progressId) {
+    $(progressId)?.classList.remove('visible');
+}
+
+// ─────────────────────────────────────────────────────────────────
+// MERGE FORM
+// ─────────────────────────────────────────────────────────────────
+function initMergeForm() {
     const form = $('merge-form');
     if (!form) return;
-    const audioTogglePairs = [
-      { btnId: 'audio-toggle-script', panelId: 'tts-panel' },
-      { btnId: 'audio-toggle-upload', panelId: 'audio-upload-panel' },
-      { btnId: 'audio-toggle-none', panelId: 'no-audio-panel' },
-    ];
-    wireToggleGroup(audioTogglePairs);
 
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      if (selectedVideoFiles.length === 0) {
-        toast('Please add at least one video clip.', 'error');
-        return;
-      }
-      const fd = new FormData(form);
-      fd.delete('videos');
-      selectedVideoFiles.forEach((f) => fd.append('videos', f));
-      fd.set('audio_source', currentToggleType(audioTogglePairs));
-      fd.set('language', $('tts-language')?.value || 'ur-PK'); // no name attr on this select
+    form.addEventListener('submit', async e => {
+        e.preventDefault();
+        const audioType = $q('#merger-tab .toggle-btn.active')?.dataset.type || 'none';
 
-      setSubmitting('merge-submit-btn', true);
-      const progress = simulateProgress('merge', ['Merging clips…', 'Generating audio…', 'Mixing tracks…', 'Finalising…']);
-      try {
-        const res = await fetch('/api/merge', { method: 'POST', body: fd });
-        const data = await res.json();
-        if (!res.ok || !data.success) throw new Error(data.error || 'Merge failed');
-        progress.finish();
-        toast('✅ Video merged successfully!');
-        selectedVideoFiles = [];
-        $('video-queue').innerHTML = '';
-        $('video-count-pill').style.display = 'none';
-        loadLibrary();
-      } catch (err) {
-        progress.fail();
-        toast(err.message || 'Merge failed', 'error');
-      } finally {
-        setSubmitting('merge-submit-btn', false);
-      }
+        if (audioType === 'script' && !$('script_text').value.trim()) {
+            showToast('⚠️ Please enter a voiceover script', 'error'); return;
+        }
+
+        const fd = new FormData(form);
+        fd.set('audio_source', audioType);
+
+        // Sync slider values to form data (use tts- prefix for merge tab)
+        const rateV  = parseInt($('tts-rate-slider')?.value || 0);
+        const pitchV = parseInt($('tts-pitch-slider')?.value || 0);
+        fd.set('rate',  rateV  >= 0 ? `+${rateV}%`   : `${rateV}%`);
+        fd.set('pitch', pitchV >= 0 ? `+${pitchV}Hz`  : `${pitchV}Hz`);
+        fd.set('style', state.currentStyle);
+
+        const btn = $('merge-submit-btn');
+        btn.disabled = true; btn.classList.add('loading');
+        showProgress('merge-progress');
+
+        const steps = [
+            { pct: 25, label: '🎞️ Processing video clips…',  dur: 1800 },
+            { pct: 50, label: '🔗 Merging & cropping…',       dur: 2200 },
+            { pct: 70, label: '🎙️ Generating voiceover…',     dur: 1800 },
+            { pct: 90, label: '🎵 Mixing audio tracks…',       dur: 1200 },
+            { pct: 99, label: '📦 Finalising output…',         dur: 800  },
+        ];
+        startProgress('merge-fill', 'merge-pct', 'merge-step', steps);
+
+        try {
+            const res  = await fetch('/api/merge', { method: 'POST', body: fd });
+            const data = await res.json();
+
+            $('merge-fill').style.width = '100%';
+            $('merge-pct').textContent  = '100%';
+            $('merge-step').textContent = '✅ Done!';
+
+            if (data.success) {
+                showToast(`✅ ${data.message}`, 'success', 5000);
+                state.statsAudio++;
+                animateCount($('stat-audio'), state.statsAudio);
+                await loadGallery();
+            } else {
+                showToast(`❌ ${data.error}`, 'error', 6000);
+            }
+        } catch (err) {
+            showToast('❌ Network error — check server', 'error');
+        } finally {
+            btn.disabled = false; btn.classList.remove('loading');
+            setTimeout(() => hideProgress('merge-progress'), 2000);
+        }
     });
-  }
+}
 
-  /* ---------------- Form: YouTube Clipper ---------------- */
-  function initClipForm() {
+// ─────────────────────────────────────────────────────────────────
+// CLIP FORM
+// ─────────────────────────────────────────────────────────────────
+function initClipForm() {
     const form = $('clip-form');
     if (!form) return;
-    const slicingPairs = [
-      { btnId: 'clip-toggle-auto', panelId: 'auto-clip-panel' },
-      { btnId: 'clip-toggle-ts', panelId: 'timestamps-clip-panel' },
-    ];
-    wireToggleGroup(slicingPairs);
 
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const fd = new FormData(form);
-      fd.set('mode', currentToggleType(slicingPairs)); // no field named "mode" in the HTML
+    form.addEventListener('submit', async e => {
+        e.preventDefault();
+        const url = $('url')?.value.trim();
+if (!url || (!url.includes('youtube.com') && !url.includes('youtu.be'))) {
+    showToast('⚠️ Please enter a valid YouTube URL', 'error'); return;
+}
 
-      setSubmitting('clip-submit-btn', true);
-      const progress = simulateProgress('clip', ['Downloading video…', 'Slicing clips…', 'Applying safety filters…', 'Finalising…']);
-      try {
-        const res = await fetch('/api/clip', { method: 'POST', body: fd });
-        const data = await res.json();
-        if (!res.ok || !data.success) throw new Error(data.error || 'Clipping failed');
-        progress.finish();
-        toast(data.message || '✅ Clips created!');
-        loadLibrary();
-      } catch (err) {
-        progress.fail();
-        toast(err.message || 'Clipping failed', 'error');
-      } finally {
-        setSubmitting('clip-submit-btn', false);
-      }
+        const btn = $('clip-submit-btn');
+        btn.disabled = true; btn.classList.add('loading');
+        showProgress('clip-progress');
+
+        const steps = [
+            { pct: 20, label: '⬇️ Downloading video…',        dur: 3000 },
+            { pct: 50, label: '✂️ Slicing into clips…',         dur: 2500 },
+            { pct: 75, label: '🎨 Applying safety filters…',   dur: 2000 },
+            { pct: 90, label: '💾 Saving clips to library…',   dur: 1200 },
+            { pct: 99, label: '📦 Cleaning up temp files…',    dur: 600  },
+        ];
+        startProgress('clip-fill', 'clip-pct', 'clip-step', steps);
+
+        try {
+            const fd  = new FormData(form);
+            const res = await fetch('/api/clip', { method: 'POST', body: fd });
+            const data = await res.json();
+
+            $('clip-fill').style.width = '100%';
+            $('clip-pct').textContent  = '100%';
+            $('clip-step').textContent = '✅ Done!';
+
+            if (data.success) {
+                showToast(`✅ ${data.message}`, 'success', 5000);
+                state.statsClips += data.filenames?.length || 0;
+                animateCount($('stat-clips'), state.statsClips);
+                await loadGallery();
+            } else {
+                showToast(`❌ ${data.error}`, 'error', 7000);
+            }
+        } catch (err) {
+            showToast('❌ Network error — check server logs', 'error');
+        } finally {
+            btn.disabled = false; btn.classList.remove('loading');
+            setTimeout(() => hideProgress('clip-progress'), 2000);
+        }
     });
-  }
+}
 
-  /* ---------------- Form: AI Video Creator ---------------- */
-  function initAiForm() {
+function initAIVideoForm() {
     const form = $('ai-video-form');
     if (!form) return;
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const fd = new FormData(form);
-      setSubmitting('ai-submit-btn', true);
-      const progress = simulateProgress('ai', ['Writing scene plan…', 'Generating voiceover…', 'Fetching visuals…', 'Rendering video…']);
-      try {
-        const res = await fetch('/api/generate-video', { method: 'POST', body: fd });
-        const data = await res.json();
-        if (!res.ok || !data.success) throw new Error(data.error || 'Generation failed');
-        progress.finish();
-        toast('✅ AI video generated!');
-        loadLibrary();
-      } catch (err) {
-        progress.fail();
-        toast(err.message || 'Generation failed', 'error');
-      } finally {
-        setSubmitting('ai-submit-btn', false);
-      }
+
+    form.addEventListener('submit', async e => {
+        e.preventDefault();
+        
+        const scriptText = $('ai_script_text').value.trim();
+        if (!scriptText) {
+            showToast('⚠️ Please enter a script', 'error');
+            return;
+        }
+
+        const fd = new FormData(form);
+        
+        // Sync slider values to form data
+        const rateV  = parseInt($('ai-rate-slider')?.value || 0);
+        const pitchV = parseInt($('ai-pitch-slider')?.value || 0);
+        fd.set('rate',  rateV  >= 0 ? `+${rateV}%`   : `${rateV}%`);
+        fd.set('pitch', pitchV >= 0 ? `+${pitchV}Hz`  : `${pitchV}Hz`);
+        fd.set('style', state.aiCurrentStyle || '');
+
+        const btn = $('ai-submit-btn');
+        btn.disabled = true;
+        btn.classList.add('loading');
+        showProgress('ai-progress');
+
+        const steps = [
+            { pct: 15, label: '📝 Parsing script & sentences…', dur: 1200 },
+            { pct: 35, label: '🎙️ Generating narration speech…', dur: 3500 },
+            { pct: 60, label: '🖼️ Downloading stock imagery…', dur: 4500 },
+            { pct: 85, label: '🪄 Rendering dynamic slides…',  dur: 4000 },
+            { pct: 98, label: '📦 Mixing & assembling video…', dur: 2000 },
+        ];
+        startProgress('ai-fill', 'ai-pct', 'ai-step', steps);
+
+        try {
+            const res = await fetch('/api/generate-video', { method: 'POST', body: fd });
+            const data = await res.json();
+
+            $('ai-fill').style.width = '100%';
+            $('ai-pct').textContent  = '100%';
+            $('ai-step').textContent = '✅ Done!';
+
+            if (data.success) {
+                showToast(`✅ ${data.message} (${data.slides} slides)`, 'success', 5000);
+                await loadGallery();
+            } else {
+                showToast(`❌ ${data.error}`, 'error', 7000);
+            }
+        } catch (err) {
+            showToast('❌ Network error — check server logs', 'error');
+        } finally {
+            btn.disabled = false;
+            btn.classList.remove('loading');
+            setTimeout(() => hideProgress('ai-progress'), 2000);
+        }
     });
-  }
+}
 
-  /* ---------------- Media Library ---------------- */
-  let libraryCache = [];
+// ─────────────────────────────────────────────────────────────────
+// INIT
+// ─────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
 
-  function openModal(filename) {
-    $('modal-title').textContent = `▶ ${filename}`;
-    $('modal-player').src = `/api/outputs/${encodeURIComponent(filename)}`;
-    $('video-modal').classList.add('active');
-  }
-  function closeModal() {
-    $('video-modal').classList.remove('active');
-    const player = $('modal-player');
-    player.pause();
-    player.src = '';
-  }
+    // Add age to state
+    state.currentAge   = 'adult';
+    state.aiCurrentAge = 'adult';
 
-  function renderLibrary(list) {
-    const container = $('gallery-container');
-    if (!container) return;
-    if (list.length === 0) {
-      container.innerHTML = `<div class="empty-library">
-          <div class="library-empty-art">🎞️</div>
-          <span>No files exported yet.<br>Run a merge or clipping operation to begin.</span>
-        </div>`;
-      return;
-    }
-    container.innerHTML = '';
-    list.forEach((item) => {
-      const el = document.createElement('div');
-      el.className = 'library-item';
-      el.innerHTML = `
-        <div class="library-item-info">
-          <span class="library-item-name" title="${item.filename}">${item.filename}</span>
-          <span class="library-item-meta">${item.size} · ${item.duration}</span>
-        </div>
-        <div class="library-item-actions">
-          <button type="button" class="play-btn" title="Play">▶</button>
-          <a href="/api/outputs/${encodeURIComponent(item.filename)}" download title="Download">⬇</a>
-        </div>`;
-      el.querySelector('.play-btn').addEventListener('click', () => openModal(item.filename));
-      container.appendChild(el);
-    });
-  }
-
-  function updateStats(list) {
-    const clips = list.filter((f) => f.filename.startsWith('clip_')).length;
-    const withAudio = list.filter((f) => f.filename.startsWith('merged_') || f.filename.startsWith('ai_video_')).length;
-    if ($('stat-files')) $('stat-files').textContent = list.length;
-    if ($('stat-clips')) $('stat-clips').textContent = clips;
-    if ($('stat-audio')) $('stat-audio').textContent = withAudio;
-  }
-
-  async function loadLibrary() {
-    try {
-      const res = await fetch('/api/outputs');
-      libraryCache = await res.json();
-      renderLibrary(libraryCache);
-      updateStats(libraryCache);
-    } catch (err) {
-      console.error('Failed to load library', err);
-    }
-  }
-
-  function initLibrary() {
-    $('refresh-gallery')?.addEventListener('click', loadLibrary);
-    $('clear-library-btn')?.addEventListener('click', async () => {
-      if (!confirm('Delete all exported files? This cannot be undone.')) return;
-      try {
-        const res = await fetch('/api/clear-library', { method: 'POST' });
-        const data = await res.json();
-        toast(`🗑 Deleted ${data.deleted} file(s)`);
-        loadLibrary();
-      } catch (err) {
-        toast('Failed to clear library', 'error');
-      }
-    });
-    $('library-search')?.addEventListener('input', (e) => {
-      const q = e.target.value.trim().toLowerCase();
-      const filtered = q ? libraryCache.filter((f) => f.filename.toLowerCase().includes(q)) : libraryCache;
-      renderLibrary(filtered);
-    });
-    $('modal-close')?.addEventListener('click', closeModal);
-    $('modal-close-btn')?.addEventListener('click', closeModal);
-  }
-
-  /* ---------------- Boot ---------------- */
-  async function boot() {
+    // 1. Initialize synchronous UI components immediately so they are clickable
     initTabs();
+    initAudioToggle();
     initDropzone();
+    initSliders('tts');
+    initSliders('ai');
     initMergeForm();
     initClipForm();
-    initAiForm();
-    initLibrary();
+    initAIVideoForm();
 
-    try {
-      const res = await fetch('/api/voices');
-      VOICE_DATA = await res.json();
-      initVoicePanel({
-        lang: 'tts-language', voice: 'tts-voice', moodGrid: 'tts-mood-grid', moodTag: 'tts-mood-support-tag',
-        ageGrid: 'tts-age-grid', rateSlider: 'tts-rate-slider', pitchSlider: 'tts-pitch-slider',
-        rateVal: 'tts-rate-val', pitchVal: 'tts-pitch-val', styleHidden: 'tts-style',
-        styleDegreeHidden: 'tts-style-degree', rateHidden: 'tts-rate', pitchHidden: 'tts-pitch',
-      });
-      initVoicePanel({
-        lang: 'ai-language', voice: 'ai-voice', moodGrid: 'ai-mood-grid', moodTag: 'ai-mood-support-tag',
-        ageGrid: 'ai-age-grid', rateSlider: 'ai-rate-slider', pitchSlider: 'ai-pitch-slider',
-        rateVal: 'ai-rate-val', pitchVal: 'ai-pitch-val', styleHidden: 'ai-tts-style',
-        styleDegreeHidden: 'ai-tts-style-degree', rateHidden: 'ai-tts-rate', pitchHidden: 'ai-tts-pitch',
-      });
-      wirePreviewButton('preview-voice-btn', {
-        lang: 'tts-language', voice: 'tts-voice', styleHidden: 'tts-style', styleDegreeHidden: 'tts-style-degree',
-        rateHidden: 'tts-rate', pitchHidden: 'tts-pitch', playerWrap: 'voice-preview-player', audioEl: 'preview-audio',
-      });
-      wirePreviewButton('ai-preview-voice-btn', {
-        lang: 'ai-language', voice: 'ai-voice', styleHidden: 'ai-tts-style', styleDegreeHidden: 'ai-tts-style-degree',
-        rateHidden: 'ai-tts-rate', pitchHidden: 'ai-tts-pitch', playerWrap: 'ai-voice-preview-player', audioEl: 'ai-preview-audio',
-      });
-    } catch (err) {
-      console.error('Failed to load voice catalog', err);
-      toast('Could not load voice list from server', 'error');
+    // Video modal
+    $('modal-close')?.addEventListener('click', closeVideoModal);
+    $('modal-close-btn')?.addEventListener('click', closeVideoModal);
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeVideoModal(); });
+
+    // Ratio card visual selection
+    document.querySelectorAll('.ratio-card input[type=radio]').forEach(radio => {
+        radio.addEventListener('change', () => {
+            document.querySelectorAll('.ratio-card').forEach(c => c.classList.remove('selected'));
+            radio.closest('.ratio-card').classList.add('selected');
+        });
+        if (radio.checked) radio.closest('.ratio-card').classList.add('selected');
+    });
+
+    // Populate AI language selector from TTS language selector
+    const aiLang = $('ai-language');
+    if (aiLang && $('tts-language')) {
+        aiLang.innerHTML = $('tts-language').innerHTML;
     }
 
-    loadLibrary();
-  }
+    // 2. Load async data without blocking UI click handlers
+    (async () => {
+        try {
+            await loadVoices();
+            buildAgeGrid('tts');
+            buildAgeGrid('ai');
+        } catch (err) {
+            console.error("Error loading voices:", err);
+        }
 
-  document.addEventListener('DOMContentLoaded', boot);
-})();
+        try {
+            await loadGallery();
+        } catch (err) {
+            console.error("Error loading gallery:", err);
+        }
+
+        // Voice interactions (TTS Panel)
+        $('tts-language')?.addEventListener('change', e => {
+            state.currentLang  = e.target.value;
+            state.currentStyle = '';
+            state.currentAge   = 'adult';
+            $('tts-style').value = '';
+            updateVoiceDropdown(e.target.value, 'tts');
+            buildAgeGrid('tts');
+        });
+
+        $('tts-voice')?.addEventListener('change', () => {
+            state.currentStyle = '';
+            $('tts-style').value = '';
+            updateMoodGrid('tts');
+        });
+
+        $('preview-voice-btn')?.addEventListener('click', () => previewVoice('tts'));
+
+        // Voice interactions (AI Panel)
+        $('ai-language')?.addEventListener('change', e => {
+            state.aiCurrentLang  = e.target.value;
+            state.aiCurrentStyle = '';
+            state.aiCurrentAge   = 'adult';
+            $('ai-tts-style').value = '';
+            updateVoiceDropdown(e.target.value, 'ai');
+            buildAgeGrid('ai');
+        });
+
+        $('ai-voice')?.addEventListener('change', () => {
+            state.aiCurrentStyle = '';
+            $('ai-tts-style').value = '';
+            updateMoodGrid('ai');
+        });
+
+        $('ai-preview-voice-btn')?.addEventListener('click', () => previewVoice('ai'));
+
+        // Library
+        $('refresh-gallery')?.addEventListener('click', loadGallery);
+        $('clear-library-btn')?.addEventListener('click', clearLibrary);
+        $('library-search')?.addEventListener('input', loadGallery);
+
+        // Auto-refresh library every 30s
+        setInterval(loadGallery, 30000);
+    })();
+});

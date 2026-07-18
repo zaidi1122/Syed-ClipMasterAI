@@ -28,7 +28,7 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 # ── Clean up any leftover temp/partial files on startup ──
 for _f in os.listdir(OUTPUT_FOLDER):
     if '.temp' in _f or 'TEMP_MPY' in _f or _f.endswith('.part'):
-       try:
+        try:
             os.remove(os.path.join(OUTPUT_FOLDER, _f))
             print(f'[cleanup] Removed temp file: {_f}')
         except Exception:
@@ -63,7 +63,7 @@ def preview_voice():
     Generate a short voice preview sample and stream it back as audio/mpeg.
     Body: { voice, lang, style, style_degree, rate, pitch }
     """
-     import tempfile
+    import tempfile
     from flask import send_file
 
     voice        = request.form.get('voice', 'en-US-EmmaMultilingualNeural')
@@ -252,20 +252,15 @@ def clip_youtube_video():
             has_curl_cffi = True
         except ImportError:
             has_curl_cffi = False
-       print("curl_cffi installed:", has_curl_cffi)
 
         download_cmd = [
             ytdlp_bin,
-            #cookies
-            "--cookies", "cookies.txt",
             # Quality: max 720p
             "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
             "--merge-output-format", "mp4",
             # Player client: ios/android work for most videos without embedding restrictions
             # tv_embedded is intentionally excluded — it fails for non-embeddable videos
-       "--extractor-args", "youtube:player_client=android",
-# Force IPv4 (Render DNS/network issues ke liye)
-       "--force-ipv4",
+            "--extractor-args", "youtube:player_client=ios,android,mweb,web",
             # Geo-bypass
             "--geo-bypass",
             # SSL resilience
@@ -286,8 +281,6 @@ def clip_youtube_video():
             download_cmd.insert(3, "--impersonate")
 
         result = subprocess.run(download_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=480)
-print("STDOUT:", result.stdout.decode("utf-8", errors="ignore"))
-print("STDERR:", result.stderr.decode("utf-8", errors="ignore"))
         stderr_text = result.stderr.decode('utf-8', errors='ignore')
         
         if result.returncode != 0 or not os.path.exists(raw_download_path) or os.path.getsize(raw_download_path) == 0:
@@ -473,6 +466,6 @@ def download_file(filename):
 if __name__ == '__main__':
     import os
     port = int(os.environ.get('PORT', 5005))
-    host = os.environ.get('HOST', '0.0.0.0')
+    host = os.environ.get('HOST', '127.0.0.1')
     debug = os.environ.get('FLASK_ENV', 'production') == 'development'
     app.run(debug=debug, host=host, port=port)

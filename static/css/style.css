@@ -939,53 +939,6 @@ input[type="file"]:hover { border-color: var(--border-bright); }
 .library-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 8px; }
 .library-list::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
 
-.library-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    padding: 11px 13px;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: var(--r-md);
-    margin-bottom: 9px;
-    transition: all var(--t-fast);
-}
-.library-item:hover { background: var(--bg-card-hover); border-color: var(--border-bright); }
-.library-item-info { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.library-item-name {
-    font-size: 0.82rem;
-    font-weight: 600;
-    color: var(--text);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 200px;
-}
-.library-item-meta { font-size: 0.71rem; color: var(--text-muted); }
-.library-item-actions { display: flex; gap: 6px; flex-shrink: 0; }
-.library-item-actions button, .library-item-actions a {
-    background: rgba(0,242,254,0.08);
-    border: 1px solid rgba(0,242,254,0.18);
-    color: var(--primary);
-    border-radius: var(--r-sm);
-    width: 30px;
-    height: 30px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    text-decoration: none;
-    font-size: 0.85rem;
-    transition: var(--t-fast);
-}
-.library-item-actions button:hover, .library-item-actions a:hover {
-    background: rgba(0,242,254,0.16);
-    border-color: var(--primary);
-}
-.library-item-actions .del-btn { color: var(--red); background: rgba(255,45,85,0.08); border-color: rgba(255,45,85,0.2); }
-.library-item-actions .del-btn:hover { background: rgba(255,45,85,0.16); border-color: var(--red); }
-
 .empty-library {
     display: flex;
     flex-direction: column;
