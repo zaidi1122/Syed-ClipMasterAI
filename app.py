@@ -11,10 +11,11 @@ from flask import Flask, request, jsonify, send_from_directory, render_template
 
 from utils.audio_engine import (
     generate_speech, create_mixed_audio, generate_preview,
-    generate_ai_video,
+    generate_ai_video, generate_synced_narration,
+    write_srt, build_caption_cues_from_groups, build_caption_cues_estimated,
     VOICES, VOICE_STYLES, MOOD_LABELS, AGE_PRESETS
 )
-from utils.video_effects import concatenate_clips, apply_copyright_filters, slice_video
+from utils.video_effects import concatenate_clips, apply_copyright_filters, slice_video, burn_subtitles
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 
@@ -33,14 +34,6 @@ for _f in os.listdir(OUTPUT_FOLDER):
             print(f'[cleanup] Removed temp file: {_f}')
         except Exception:
             pass
-
-# Helper to execute shell commands (e.g. yt-dlp using local venv)
-def get_pip_binary(binary_name):
-    # Returns path to binary in virtual env
-    venv_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'venv', 'bin', binary_name)
-    if os.path.exists(venv_bin):
-        return venv_bin
-    return binary_name
 
 @app.route('/')
 def index():
@@ -116,6 +109,7 @@ def merge_videos():
         voice_id      = request.form.get('voice', 'ur-PK-UzmaNeural')
         script_text   = request.form.get('script_text', '')
         trim_audio    = request.form.get('trim_audio', 'true') == 'true'
+        want_captions = request.form.get('captions', 'false') == 'true'
         # Voice style / mood params
         voice_style        = request.form.get('style', '')
         voice_style_degree = float(request.form.get('style_degree', 1.0))
@@ -139,20 +133,37 @@ def merge_videos():
             
         # 1. Merge videos together
         merged_temp_video = os.path.join(UPLOAD_FOLDER, f"{job_id}_merged_raw.mp4")
-        duration = concatenate_clips(video_paths, aspect_ratio=aspect_ratio, output_path=merged_temp_video)
-        
+        duration, clip_durations = concatenate_clips(video_paths, aspect_ratio=aspect_ratio, output_path=merged_temp_video)
+
         # 2. Process / Generate audio
         final_audio_path = None
         speech_path = None
         bg_music_path = None
-        
+        narration_groups = None   # exact per-clip text, for caption timing
+
         if audio_source == 'script' and script_text.strip():
-            # Generate speech audio
             speech_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_speech.mp3")
-            generate_speech(script_text, voice_id, speech_path,
-                            rate=voice_rate, pitch=voice_pitch,
-                            style=voice_style, style_degree=voice_style_degree)
-            
+            if len(clip_durations) > 1:
+                # Multiple clips: sync narration segments to each clip's actual
+                # duration so the voiceover never drifts ahead of / behind
+                # whatever clip is currently on screen.
+                synced_ok, narration_groups = generate_synced_narration(
+                    script_text, clip_durations, voice_id, speech_path,
+                    rate=voice_rate, pitch=voice_pitch,
+                    style=voice_style, style_degree=voice_style_degree
+                )
+                if not synced_ok:
+                    # Fallback: one continuous narration track (old behavior)
+                    generate_speech(script_text, voice_id, speech_path,
+                                    rate=voice_rate, pitch=voice_pitch,
+                                    style=voice_style, style_degree=voice_style_degree)
+                    narration_groups = None
+            else:
+                # Single clip — no per-clip syncing needed
+                generate_speech(script_text, voice_id, speech_path,
+                                rate=voice_rate, pitch=voice_pitch,
+                                style=voice_style, style_degree=voice_style_degree)
+
         elif audio_source == 'upload':
             uploaded_audio = request.files.get('audio_file')
             if uploaded_audio and uploaded_audio.filename != '':
@@ -194,7 +205,23 @@ def merge_videos():
         else:
             # No audio overlay, rename raw merged video
             os.rename(merged_temp_video, final_output_path)
-            
+
+        # 3b. Burn in captions (script-based narration only — timing is only
+        # known accurately when we generated the speech ourselves)
+        if want_captions and audio_source == 'script' and script_text.strip():
+            if narration_groups is not None:
+                cues = build_caption_cues_from_groups(narration_groups, clip_durations)
+            else:
+                cues = build_caption_cues_estimated(script_text, duration)
+            srt_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_captions.srt")
+            if cues and write_srt(cues, srt_path):
+                captioned_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_captioned.mp4")
+                if burn_subtitles(final_output_path, srt_path, captioned_path):
+                    os.remove(final_output_path)
+                    os.rename(captioned_path, final_output_path)
+                if os.path.exists(srt_path):
+                    os.remove(srt_path)
+
         # Cleanup temp upload files
         for p in video_paths + [merged_temp_video, speech_path, bg_music_path, final_audio_path]:
             if p and os.path.exists(p):
@@ -216,97 +243,33 @@ def merge_videos():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/clip', methods=['POST'])
-def clip_youtube_video():
+def clip_uploaded_video():
     """
-    Downloads a YouTube video, cuts it into clips, and applies anti-copyright filters.
+    Accepts one or more uploaded videos, cuts each into clips, and applies
+    anti-copyright filters. (Previously downloaded from YouTube via yt-dlp —
+    replaced with direct upload since YouTube's bot-detection made downloads
+    unreliable.)
     """
     try:
-        url = request.form.get('url')
-        if not url:
-            return jsonify({'success': False, 'error': 'YouTube URL is required.'}), 400
-            
-        mode = request.form.get('mode', 'auto') # 'auto' or 'timestamps'
+        uploaded_files = request.files.getlist('videos')
+        uploaded_files = [f for f in uploaded_files if f and f.filename]
+        if not uploaded_files:
+            return jsonify({'success': False, 'error': 'Please upload at least one video.'}), 400
+
+        mode = request.form.get('mode', 'auto')  # 'auto' or 'timestamps'
         interval = int(request.form.get('interval', 8))
         timestamps_str = request.form.get('timestamps', '')
-        
+
         # Filter options
         filters = {
             'aspect_ratio': request.form.get('aspect_ratio', 'original'),
+            'quality': request.form.get('quality', '1080p'),
             'mirror': request.form.get('mirror', 'true') == 'true',
             'zoom': request.form.get('zoom', 'true') == 'true',
             'speed': float(request.form.get('speed', 1.04)),
             'pitch_shift': float(request.form.get('pitch_shift', 0.8))
         }
-        
-        job_id = str(uuid.uuid4())
-        raw_download_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_raw.mp4")
-        
-        # 1. Download YouTube Video using yt-dlp
-        ytdlp_bin = get_pip_binary('yt-dlp')
-        
-        print(f"Downloading video from {url}...")
 
-        # Check if curl-cffi is available for --impersonate support
-        try:
-            import curl_cffi
-            has_curl_cffi = True
-        except ImportError:
-            has_curl_cffi = False
-
-        download_cmd = [
-            ytdlp_bin,
-            # Quality: max 720p
-            "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-            "--merge-output-format", "mp4",
-            # Player client: ios/android work for most videos without embedding restrictions
-            # tv_embedded is intentionally excluded — it fails for non-embeddable videos
-            "--extractor-args", "youtube:player_client=ios,android,mweb,web",
-            # Geo-bypass
-            "--geo-bypass",
-            # SSL resilience
-            "--no-check-certificates",
-            "--socket-timeout", "60",
-            # Retry logic
-            "--retries", "10",
-            "--fragment-retries", "10",
-            "--retry-sleep", "exp=1:30",
-            # Output
-            "-o", raw_download_path,
-            url
-        ]
-
-        # Only add --impersonate if curl-cffi is installed
-        if has_curl_cffi:
-            download_cmd.insert(3, "chrome")
-            download_cmd.insert(3, "--impersonate")
-
-        result = subprocess.run(download_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=480)
-        stderr_text = result.stderr.decode('utf-8', errors='ignore')
-        
-        if result.returncode != 0 or not os.path.exists(raw_download_path) or os.path.getsize(raw_download_path) == 0:
-            # Check impersonation error FIRST before generic "unavailable"
-            if 'impersonate' in stderr_text.lower() or ('curl' in stderr_text.lower() and 'cffi' in stderr_text.lower()):
-                err = 'Browser impersonation library missing. Try again (it will retry without impersonation).'
-            elif 'SSL' in stderr_text or 'EOF' in stderr_text:
-                err = 'YouTube SSL error. Try a different video or try again in a few seconds.'
-            elif 'Private' in stderr_text or 'members-only' in stderr_text:
-                err = 'This video is private or members-only.'
-            elif 'Sign in' in stderr_text:
-                err = 'YouTube requires sign-in for this video. Try a fully public video.'
-            elif 'removed' in stderr_text or 'unavailable' in stderr_text or 'not available' in stderr_text:
-                err = 'This video is unavailable or has been removed from YouTube.'
-            elif 'bot' in stderr_text.lower() or 'detected' in stderr_text.lower():
-                err = 'YouTube detected bot activity. Try a different video.'
-            else:
-                # Show raw error so we can diagnose
-                err = f'yt-dlp error: {stderr_text[-800:]}' if stderr_text else 'Unknown download error'
-            return jsonify({'success': False, 'error': f'Download failed: {err}'}), 500
-
-            
-        # 2. Slice downloaded video
-        temp_clips_dir = os.path.join(UPLOAD_FOLDER, f"{job_id}_slices")
-        os.makedirs(temp_clips_dir, exist_ok=True)
-        
         custom_ranges = []
         if mode == 'timestamps' and timestamps_str:
             # Parse timestamps "10-20, 30-45"
@@ -320,42 +283,52 @@ def clip_youtube_video():
                         custom_ranges.append([start_t, end_t])
                     except ValueError:
                         pass
-                        
-        sliced_files = slice_video(
-            raw_download_path,
-            temp_clips_dir,
-            mode=mode,
-            intervals=interval,
-            custom_ranges=custom_ranges
-        )
-        
-        if not sliced_files:
-            return jsonify({'success': False, 'error': 'No clips generated during slicing.'}), 500
-            
-        # 3. Apply safety filters to each clip and save to outputs
-        processed_files = []
-        for idx, file_path in enumerate(sliced_files, 1):
-            out_filename = f"clip_{job_id[:8]}_{idx}.mp4"
-            out_path = os.path.join(OUTPUT_FOLDER, out_filename)
-            
-            apply_copyright_filters(file_path, out_path, filters)
-            if os.path.exists(out_path):
-                processed_files.append(out_filename)
-                
-        # Cleanup raw downloaded file & sliced folder
-        if os.path.exists(raw_download_path):
-            os.remove(raw_download_path)
-            
+
         import shutil
-        if os.path.exists(temp_clips_dir):
-            shutil.rmtree(temp_clips_dir)
-            
+        processed_files = []
+
+        for video_file in uploaded_files:
+            job_id = str(uuid.uuid4())
+            safe_ext = os.path.splitext(video_file.filename)[1] or '.mp4'
+            raw_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_raw{safe_ext}")
+            video_file.save(raw_path)
+
+            if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+                continue
+
+            temp_clips_dir = os.path.join(UPLOAD_FOLDER, f"{job_id}_slices")
+            os.makedirs(temp_clips_dir, exist_ok=True)
+
+            sliced_files = slice_video(
+                raw_path,
+                temp_clips_dir,
+                mode=mode,
+                intervals=interval,
+                custom_ranges=custom_ranges
+            )
+
+            for idx, file_path in enumerate(sliced_files, 1):
+                out_filename = f"clip_{job_id[:8]}_{idx}.mp4"
+                out_path = os.path.join(OUTPUT_FOLDER, out_filename)
+                apply_copyright_filters(file_path, out_path, filters)
+                if os.path.exists(out_path):
+                    processed_files.append(out_filename)
+
+            # Cleanup this video's temp files
+            if os.path.exists(raw_path):
+                os.remove(raw_path)
+            if os.path.exists(temp_clips_dir):
+                shutil.rmtree(temp_clips_dir)
+
+        if not processed_files:
+            return jsonify({'success': False, 'error': 'No clips could be generated from the uploaded video(s).'}), 500
+
         return jsonify({
             'success': True,
-            'message': f'YouTube video processed into {len(processed_files)} clips!',
+            'message': f'Video processed into {len(processed_files)} clips!',
             'filenames': processed_files
         })
-        
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -418,6 +391,7 @@ def generate_video():
         voice_rate    = request.form.get('rate', '+0%')
         voice_pitch   = request.form.get('pitch', '+0Hz')
         trim_audio    = request.form.get('trim_audio', 'true') == 'true'
+        want_captions = request.form.get('captions', 'false') == 'true'
         
         if not script_text.strip():
             return jsonify({'success': False, 'error': 'Script text is required.'}), 400
@@ -437,6 +411,7 @@ def generate_video():
             pitch=voice_pitch,
             bg_music_file=bg_music_file,
             trim_audio=trim_audio,
+            captions=want_captions,
             output_path=final_output_path
         )
         
@@ -466,6 +441,6 @@ def download_file(filename):
 if __name__ == '__main__':
     import os
     port = int(os.environ.get('PORT', 5005))
-    host = os.environ.get('HOST', '127.0.0.1')
+    host = os.environ.get('HOST', '0.0.0.0')
     debug = os.environ.get('FLASK_ENV', 'production') == 'development'
     app.run(debug=debug, host=host, port=port)

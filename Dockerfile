@@ -4,19 +4,15 @@
 # ──────────────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
-# Install system deps: FFmpeg + ImageMagick (for moviepy text clips) + fonts
+# Install system deps: FFmpeg + fonts
+# (ImageMagick removed — codebase renders text via PIL/ImageDraw, not moviepy TextClip)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    imagemagick \
     libmagic1 \
     fonts-dejavu-core \
     fonts-liberation \
     curl \
     && rm -rf /var/lib/apt/lists/*
-
-# ImageMagick policy fix — allow reading/writing all file types (needed by moviepy)
-RUN sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' /etc/ImageMagick-6/policy.xml 2>/dev/null || true && \
-    sed -i 's/<policy domain="path" rights="none" pattern="@\*"\/>//' /etc/ImageMagick-6/policy.xml 2>/dev/null || true
 
 # Set working directory
 WORKDIR /app
@@ -24,8 +20,7 @@ WORKDIR /app
 # Copy and install Python dependencies first (for layer caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir gunicorn Pillow requests
+    pip install --no-cache-dir -r requirements.txt
 
 # Copy application source
 COPY . .

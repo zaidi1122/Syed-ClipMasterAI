@@ -30,7 +30,8 @@ def concatenate_clips(video_paths, aspect_ratio="vertical", output_path=None):
     """
     Concatenates multiple video files using pure FFmpeg (no moviepy).
     Each clip is normalized to the target resolution before joining.
-    Returns the total duration in seconds.
+    Returns (total_duration, per_clip_durations) — the second is needed
+    to time-align per-clip narration segments.
     """
     if not video_paths:
         raise ValueError("No video paths provided to concatenate.")
@@ -75,8 +76,8 @@ def concatenate_clips(video_paths, aspect_ratio="vertical", output_path=None):
         for p in normalized:
             f.write(f"file '{p}'\n")
 
-    # ── Step 3: Get total duration via ffprobe ────────────────────────
-    total_duration = 0.0
+    # ── Step 3: Get per-clip and total duration via ffprobe ──────────
+    clip_durations = []
     for p in normalized:
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -84,9 +85,10 @@ def concatenate_clips(video_paths, aspect_ratio="vertical", output_path=None):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         try:
-            total_duration += float(probe.stdout.strip())
+            clip_durations.append(float(probe.stdout.strip()))
         except Exception:
-            pass
+            clip_durations.append(0.0)
+    total_duration = sum(clip_durations)
 
     # ── Step 4: Concatenate ───────────────────────────────────────────
     if output_path:
@@ -113,7 +115,7 @@ def concatenate_clips(video_paths, aspect_ratio="vertical", output_path=None):
     except Exception:
         pass
 
-    return total_duration
+    return total_duration, clip_durations
 
 
 def pitch_shift_audio(input_audio_path, output_audio_path, semitones=0.8):
@@ -133,19 +135,73 @@ def pitch_shift_audio(input_audio_path, output_audio_path, semitones=0.8):
     ]
     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
 
+QUALITY_PRESETS = {
+    "720p":  {"vertical": (720, 1280),   "horizontal": (1280, 720)},
+    "1080p": {"vertical": (1080, 1920),  "horizontal": (1920, 1080)},
+    "4k":    {"vertical": (2160, 3840),  "horizontal": (3840, 2160)},
+}
+
+# Encoder preset per quality tier — higher resolutions get a slower/more
+# efficient preset since file size grows fast at 4K.
+ENCODE_PRESET = {"720p": "faster", "1080p": "fast", "4k": "medium"}
+
+
+def burn_subtitles(input_path: str, srt_path: str, output_path: str) -> bool:
+    """
+    Burns styled captions into the video using FFmpeg's libass-based
+    subtitles filter. Font size scales with video height for readability
+    on both 9:16 and 16:9 output.
+    """
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=height",
+         "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        height = int(probe.stdout.strip())
+    except Exception:
+        height = 1080
+    font_size = max(24, round(height * 0.045))
+
+    # Escape path for the ffmpeg filter graph (colons/backslashes need escaping)
+    escaped_srt = srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+    style = (
+        f"FontName=DejaVu Sans,FontSize={font_size},"
+        "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+        "BorderStyle=1,Outline=2,Shadow=0,Bold=1,"
+        "Alignment=2,MarginV=" + str(round(height * 0.06))
+    )
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", f"subtitles='{escaped_srt}':force_style='{style}'",
+        "-c:v", "libx264", "-preset", "fast",
+        "-c:a", "copy",
+        output_path
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return (result.returncode == 0 and os.path.exists(output_path)
+            and os.path.getsize(output_path) > 0)
+
+
 def apply_copyright_filters(input_path, output_path, options):
     """
     Applies visual and audio transformations to bypass copyright filters.
     Uses pure FFmpeg subprocess for reliability — no moviepy silent failures.
 
     Filters applied:
-    - Aspect Ratio (vertical 9:16, horizontal 16:9, or original)
+    - Aspect Ratio (vertical 9:16, horizontal 16:9, or original) at a chosen quality tier
     - Horizontal mirror (hflip)
     - 5% center zoom-in (crop + scale)
     - Speed adjustment (setpts + atempo)
     - Audio pitch shift (asetrate + atempo correction)
     """
     aspect       = options.get("aspect_ratio", "original")
+    quality      = options.get("quality", "1080p")
+    if quality not in QUALITY_PRESETS:
+        quality = "1080p"
     do_mirror    = options.get("mirror", True)
     do_zoom      = options.get("zoom", True)
     speed_factor = float(options.get("speed", 1.04))
@@ -163,13 +219,10 @@ def apply_copyright_filters(input_path, output_path, options):
     # ── Build video filter chain ──────────────────────────────────────
     vf = []
 
-    if aspect == "vertical":
-        # Crop to 9:16 center, scale to 1080×1920
-        vf.append("scale=1080:1920:force_original_aspect_ratio=decrease,"
-                  "pad=1080:1920:-1:-1:color=black")
-    elif aspect == "horizontal":
-        vf.append("scale=1920:1080:force_original_aspect_ratio=decrease,"
-                  "pad=1920:1080:-1:-1:color=black")
+    if aspect in ("vertical", "horizontal"):
+        target_w, target_h = QUALITY_PRESETS[quality][aspect]
+        vf.append(f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                  f"pad={target_w}:{target_h}:-1:-1:color=black")
 
     if do_mirror:
         vf.append("hflip")
@@ -201,7 +254,7 @@ def apply_copyright_filters(input_path, output_path, options):
     if vf:
         cmd += ["-vf", ",".join(vf)]
 
-    cmd += ["-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart"]
+    cmd += ["-c:v", "libx264", "-preset", ENCODE_PRESET[quality], "-movflags", "+faststart"]
 
     if has_audio:
         if af:

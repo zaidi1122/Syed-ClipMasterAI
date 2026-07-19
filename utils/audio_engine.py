@@ -1,6 +1,7 @@
 import asyncio
 import os
 import subprocess
+import tempfile
 import urllib.request
 import urllib.parse
 import uuid
@@ -110,14 +111,22 @@ MOOD_LABELS = {
 }
 
 # ─────────────────────────────────────────────────────────────────
-# AGE PRESETS  — pitch + rate combos to simulate voice age groups
-# Applied client-side via sliders; used in SSML prosody server-side
+# AGE / CHARACTER PRESETS — pitch + rate combos to simulate different
+# voice ages AND tonal characters from the same base voice. Honest note:
+# edge-tts only ships 2 base Urdu (Pakistan) voices (Uzma, Asad) — these
+# presets don't add new synthetic voices, they reshape pitch/rate/tone
+# on top of the existing ones so the same voice can sound noticeably
+# different depending on the preset picked.
 # ─────────────────────────────────────────────────────────────────
 AGE_PRESETS = {
-    "child": {"rate": "+28%",  "pitch": "+180Hz", "label": "👧 Child",  "desc": "High pitch, fast & energetic"},
-    "teen":  {"rate": "+12%",  "pitch": "+80Hz",  "label": "🧑 Teen",   "desc": "Slightly higher, lively"},
-    "adult": {"rate": "+0%",   "pitch": "+0Hz",   "label": "👩 Adult",  "desc": "Natural default tone"},
-    "aged":  {"rate": "-12%",  "pitch": "-60Hz",  "label": "👴 Aged",   "desc": "Deeper, slower, authoritative"},
+    "child":  {"rate": "+28%", "pitch": "+180Hz", "label": "👧 Child",  "desc": "High pitch, fast & energetic"},
+    "teen":   {"rate": "+12%", "pitch": "+80Hz",  "label": "🧑 Teen",   "desc": "Slightly higher, lively"},
+    "adult":  {"rate": "+0%",  "pitch": "+0Hz",   "label": "👩 Adult",  "desc": "Natural default tone"},
+    "aged":   {"rate": "-12%", "pitch": "-60Hz",  "label": "👴 Aged",   "desc": "Deeper, slower, authoritative"},
+    "deep":   {"rate": "-8%",  "pitch": "-110Hz", "label": "🎙️ Deep",   "desc": "Rich, low, cinematic tone"},
+    "crisp":  {"rate": "+8%",  "pitch": "+20Hz",  "label": "✨ Crisp",  "desc": "Clear, sharp, energetic"},
+    "warm":   {"rate": "-4%",  "pitch": "-20Hz",  "label": "🔥 Warm",   "desc": "Smooth, relaxed, inviting"},
+    "bold":   {"rate": "+5%",  "pitch": "-40Hz",  "label": "💪 Bold",   "desc": "Confident, powerful, commanding"},
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -137,8 +146,11 @@ SAMPLE_SENTENCES = {
 # ─────────────────────────────────────────────────────────────────
 async def _tts_async(text: str, voice: str, output_path: str,
                      rate: str = "+0%", pitch: str = "+0Hz",
-                     style: str = "", style_degree: float = 1.0):
-    """Generate speech with optional SSML style via edge-tts."""
+                     style: str = "", style_degree: float = 1.0,
+                     capture_timing: bool = False):
+    """Generate speech with optional SSML style via edge-tts.
+    If capture_timing=True, also returns a list of {word, start, end} dicts
+    (seconds) built from edge-tts's WordBoundary events — used for captions."""
     if style and voice in VOICE_STYLES and style in VOICE_STYLES[voice]:
         lang = voice[:5]          # e.g. "en-US"
         escaped = (text
@@ -159,7 +171,18 @@ async def _tts_async(text: str, voice: str, output_path: str,
     else:
         communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
 
-    await communicate.save(output_path)
+    word_timings = []
+    with open(output_path, "wb") as f:
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                f.write(chunk["data"])
+            elif capture_timing and chunk["type"] == "WordBoundary":
+                word_timings.append({
+                    "word": chunk["text"],
+                    "start": chunk["offset"] / 10_000_000,
+                    "end": (chunk["offset"] + chunk["duration"]) / 10_000_000,
+                })
+    return word_timings
 
 
 def parse_pitch_and_rate(pitch_str: str, rate_str: str):
@@ -235,29 +258,35 @@ def generate_speech_gtts(text: str, lang: str, output_path: str, gender: str,
 
 def generate_speech(text: str, voice: str, output_path: str,
                     rate: str = "+0%", pitch: str = "+0Hz",
-                    style: str = "", style_degree: float = 1.0) -> bool:
-    """Synchronous TTS wrapper. Returns True on success."""
+                    style: str = "", style_degree: float = 1.0,
+                    return_timing: bool = False):
+    """Synchronous TTS wrapper. Returns True on success, or (bool, word_timings)
+    if return_timing=True. word_timings is [] for gTTS voices (no boundary data)."""
     try:
         if voice.startswith("gtts-"):
             parts = voice.split("-")
             lang = parts[1]
             gender = parts[2]
-            return generate_speech_gtts(text, lang, output_path, gender, rate, pitch)
+            ok = generate_speech_gtts(text, lang, output_path, gender, rate, pitch)
+            return (ok, []) if return_timing else ok
 
         # Use a fresh event loop to avoid conflicts with gunicorn threads
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        timings = []
         try:
-            loop.run_until_complete(_tts_async(text, voice, output_path,
-                                               rate, pitch, style, style_degree))
+            timings = loop.run_until_complete(_tts_async(text, voice, output_path,
+                                               rate, pitch, style, style_degree,
+                                               capture_timing=return_timing))
         finally:
             loop.close()
             asyncio.set_event_loop(None)
 
-        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+        ok = os.path.exists(output_path) and os.path.getsize(output_path) > 0
+        return (ok, timings or []) if return_timing else ok
     except Exception as e:
         print(f"[TTS Error] {e}")
-        return False
+        return (False, []) if return_timing else False
 
 
 def generate_preview(voice: str, lang_prefix: str,
@@ -279,18 +308,30 @@ def create_mixed_audio(voiceover_path: str, bg_music_path: str,
                        bg_volume: float = 0.15) -> bool:
     """
     Mix voiceover (full vol) with optional background music (bg_volume).
-    Both are trimmed/looped to target_duration.
+    Both are trimmed/padded to target_duration.
+
+    Previously: if the voiceover was SHORTER than target_duration, nothing
+    padded it, and the merge step's `-shortest` flag then truncated the
+    entire video down to the voiceover's length — silently losing footage.
+    Now the voiceover is padded with silence to exactly match target_duration.
     """
     try:
+        from moviepy.audio.AudioClip import AudioClip, concatenate_audioclips
+
         voice_clip = AudioFileClip(voiceover_path)
         if voice_clip.duration > target_duration:
             voice_clip = voice_clip.subclip(0, target_duration)
+        elif voice_clip.duration < target_duration - 0.05:
+            pad_dur = target_duration - voice_clip.duration
+            nch = getattr(voice_clip, 'nchannels', 2) or 2
+            silence_frame = (lambda t: 0.0) if nch == 1 else (lambda t: [0.0] * nch)
+            silence = AudioClip(silence_frame, duration=pad_dur, fps=voice_clip.fps or 44100)
+            voice_clip = concatenate_audioclips([voice_clip, silence])
 
         if bg_music_path and os.path.exists(bg_music_path):
             bg_clip = AudioFileClip(bg_music_path)
             if bg_clip.duration < target_duration:
                 loops = int(target_duration / bg_clip.duration) + 1
-                from moviepy.audio.AudioClip import concatenate_audioclips
                 bg_clip = concatenate_audioclips([bg_clip] * loops)
             bg_clip = bg_clip.subclip(0, target_duration).volumex(bg_volume)
             final_audio = CompositeAudioClip([voice_clip, bg_clip])
@@ -313,6 +354,194 @@ def create_mixed_audio(voiceover_path: str, bg_music_path: str,
 UPLOAD_FOLDER_ABS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'uploads')
 
 STOPWORDS = {"welcome", "to", "the", "channel", "today", "we", "are", "going", "have", "you", "a", "an", "of", "and", "in", "is", "it", "that", "this", "for", "with", "on", "at", "by", "from", "up", "about", "into", "over", "after"}
+
+# ─────────────────────────────────────────────────────────────────
+# PER-CLIP NARRATION SYNC (Merge tab)
+# Splits the script across the uploaded clips (by sentence groups) and
+# time-fits each segment to its clip's actual duration, so narration
+# never drifts ahead of / behind the clip currently on screen.
+# ─────────────────────────────────────────────────────────────────
+
+def _distribute_sentences(sentences: list, n_groups: int) -> list:
+    """Split a sentence list into n_groups ordered, near-equal chunks.
+    If there are fewer sentences than groups, later groups are left empty
+    (silent) rather than repeating narration."""
+    groups = [[] for _ in range(n_groups)]
+    if not sentences or n_groups <= 0:
+        return groups
+    if len(sentences) >= n_groups:
+        k, m = divmod(len(sentences), n_groups)
+        idx = 0
+        for i in range(n_groups):
+            size = k + (1 if i < m else 0)
+            groups[i] = sentences[idx: idx + size]
+            idx += size
+    else:
+        for i, s in enumerate(sentences):
+            groups[i] = [s]
+    return groups
+
+
+def generate_synced_narration(script_text: str, clip_durations: list, voice_id: str,
+                               output_path: str, rate: str = "+0%", pitch: str = "+0Hz",
+                               style: str = "", style_degree: float = 1.0,
+                               max_speedup: float = 1.25) -> bool:
+    """
+    Generates one narration track whose segments are time-locked to each
+    uploaded clip's actual duration — segment i always plays exactly during
+    clip i, never drifting into the next clip.
+    Returns (success: bool, sentence_groups: list) — the groups are the
+    exact per-clip text used, needed to build caption cues with matching timing.
+    """
+    sentences = split_into_sentences(script_text)
+    n = len(clip_durations)
+    if n == 0:
+        return False, []
+    groups = _distribute_sentences(sentences, n)
+
+    tmp_dir = tempfile.mkdtemp(prefix="sync_narr_")
+    seg_paths = []
+    try:
+        for i, (group, dur) in enumerate(zip(groups, clip_durations)):
+            dur = max(dur, 0.1)
+            raw_path = os.path.join(tmp_dir, f"raw_{i}.mp3")
+            fixed_path = os.path.join(tmp_dir, f"fixed_{i}.mp3")
+            text = " ".join(group).strip()
+            has_audio = False
+
+            if text:
+                ok = generate_speech(text, voice_id, raw_path, rate=rate, pitch=pitch,
+                                      style=style, style_degree=style_degree)
+                has_audio = ok and os.path.exists(raw_path) and os.path.getsize(raw_path) > 0
+
+            if has_audio:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", raw_path],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                try:
+                    seg_dur = float(probe.stdout.strip())
+                except Exception:
+                    seg_dur = dur
+
+                factor = 1.0
+                if seg_dur > dur and dur > 0:
+                    factor = min(seg_dur / dur, max_speedup)
+
+                cmd = [
+                    "ffmpeg", "-y", "-i", raw_path,
+                    "-filter:a", f"atempo={factor:.3f},apad",
+                    "-t", f"{dur:.3f}", "-ar", "44100", "-ac", "2",
+                    fixed_path
+                ]
+                r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                has_audio = r.returncode == 0 and os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 0
+
+            if not has_audio:
+                # Silent segment — clip has no matching sentence, or TTS failed
+                cmd = [
+                    "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                    "-t", f"{dur:.3f}", "-ar", "44100", "-ac", "2", fixed_path
+                ]
+                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            if os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 0:
+                seg_paths.append(fixed_path)
+
+        if not seg_paths:
+            return False, groups
+
+        cmd = ["ffmpeg", "-y"]
+        for p in seg_paths:
+            cmd += ["-i", p]
+        filter_inputs = "".join(f"[{i}:a]" for i in range(len(seg_paths)))
+        cmd += ["-filter_complex", f"{filter_inputs}concat=n={len(seg_paths)}:v=0:a=1[out]",
+                "-map", "[out]", output_path]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        ok = (result.returncode == 0 and os.path.exists(output_path)
+              and os.path.getsize(output_path) > 0)
+        return ok, groups
+    except Exception as e:
+        print(f"[Narration Sync Error] {e}")
+        return False, []
+    finally:
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _format_srt_timestamp(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int(round((seconds - int(seconds)) * 1000))
+    if millis == 1000:
+        millis = 0
+        secs += 1
+    return f"{hrs:02d}:{mins:02d}:{secs:02d},{millis:03d}"
+
+
+def write_srt(cues: list, output_path: str) -> bool:
+    """
+    cues: list of (start_seconds, end_seconds, text) tuples, in order.
+    Writes a standard .srt subtitle file.
+    """
+    try:
+        lines = []
+        idx = 1
+        for start, end, text in cues:
+            text = (text or "").strip()
+            if not text or end <= start:
+                continue
+            lines.append(str(idx))
+            lines.append(f"{_format_srt_timestamp(start)} --> {_format_srt_timestamp(end)}")
+            lines.append(text)
+            lines.append("")
+            idx += 1
+        if not lines:
+            return False
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        return True
+    except Exception as e:
+        print(f"[SRT Write Error] {e}")
+        return False
+
+
+def build_caption_cues_from_groups(sentence_groups: list, segment_durations: list) -> list:
+    """For per-clip / per-slide narration: each group already has an exact
+    start/end (the cumulative clip durations), so captions line up exactly
+    with what's on screen — no guessing involved."""
+    cues = []
+    t = 0.0
+    for group, dur in zip(sentence_groups, segment_durations):
+        dur = max(dur, 0.1)
+        text = " ".join(group).strip()
+        if text:
+            cues.append((t, t + dur, text))
+        t += dur
+    return cues
+
+
+def build_caption_cues_estimated(script_text: str, total_duration: float) -> list:
+    """Fallback for a single continuous narration track (one clip, no
+    per-segment timing available): distributes sentences across the total
+    duration weighted by character length. Approximate, not frame-exact —
+    fine for captions, would NOT be fine for audio sync."""
+    sentences = split_into_sentences(script_text)
+    if not sentences or total_duration <= 0:
+        return []
+    weights = [max(len(s), 1) for s in sentences]
+    total_w = sum(weights)
+    cues = []
+    t = 0.0
+    for s, w in zip(sentences, weights):
+        dur = total_duration * (w / total_w)
+        cues.append((t, t + dur, s))
+        t += dur
+    return cues
+
 
 def extract_keyword(text: str) -> str:
     """Extract 1 to 2 key descriptive words from a script sentence."""
@@ -668,10 +897,11 @@ def make_image_frame_closure(i_obj, text, dur, w, h, f_path, f_sz):
 
 def generate_ai_video(script_text: str, theme: str, aspect_ratio: str,
                        voice_id: str, rate: str, pitch: str,
-                       bg_music_file, trim_audio: bool, output_path: str) -> dict:
+                       bg_music_file, trim_audio: bool, output_path: str,
+                       captions: bool = False) -> dict:
     """End-to-end AI script-to-video generation."""
     from moviepy.editor import VideoFileClip, VideoClip, concatenate_videoclips, concatenate_audioclips
-    from utils.video_effects import crop_to_aspect_ratio
+    from utils.video_effects import crop_to_aspect_ratio, burn_subtitles
 
     if aspect_ratio == 'vertical':
         target_w, target_h = 1080, 1920
@@ -708,6 +938,8 @@ def generate_ai_video(script_text: str, theme: str, aspect_ratio: str,
             lang_code = voice_id[:2]
             
         font_path = get_font_for_lang(lang_code)
+        caption_cues = []
+        running_t = 0.0
         
         for idx, sentence in enumerate(sentences):
             # 1. Voiceover for this slide
@@ -720,6 +952,8 @@ def generate_ai_video(script_text: str, theme: str, aspect_ratio: str,
             audio_clip = AudioFileClip(sentence_audio_path)
             duration = audio_clip.duration
             audio_clips.append(audio_clip)
+            caption_cues.append((running_t, running_t + duration, sentence))
+            running_t += duration
             
             # 2. Extract keyword and search stock media or generate AI scene
             keyword = base_keyword
@@ -820,6 +1054,18 @@ def generate_ai_video(script_text: str, theme: str, aspect_ratio: str,
         ]
         cmd = [c for c in cmd if c != ""]
         subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+
+        # Burn in captions — timing here is exact (each cue's window is the
+        # same duration used to generate that slide's visual), no guessing.
+        if captions and caption_cues:
+            srt_path = os.path.join(UPLOAD_FOLDER_ABS, f"{job_id}_captions.srt")
+            temp_files.append(srt_path)
+            if write_srt(caption_cues, srt_path):
+                captioned_path = os.path.join(UPLOAD_FOLDER_ABS, f"{job_id}_captioned.mp4")
+                temp_files.append(captioned_path)
+                if burn_subtitles(output_path, srt_path, captioned_path):
+                    os.remove(output_path)
+                    os.rename(captioned_path, output_path)
         
         # Cleanup clips memory
         for c in video_clips: c.close()
